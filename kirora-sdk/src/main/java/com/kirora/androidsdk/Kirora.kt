@@ -1,0 +1,1617 @@
+package com.kirora.androidsdk
+
+import android.app.Activity
+import android.app.Application
+import android.content.Context
+import android.content.Intent
+import android.os.Bundle
+import android.os.SystemClock
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.ProcessLifecycleOwner
+import com.google.gson.JsonObject
+import com.kirora.androidsdk.db.EventEntity
+import com.kirora.androidsdk.db.KiroraDatabase
+import com.kirora.androidsdk.identity.Identity
+import com.kirora.androidsdk.identity.SignedInUser
+import com.kirora.androidsdk.model.BeforeSendEvent
+import com.kirora.androidsdk.model.EventDropReason
+import com.kirora.androidsdk.model.KiroraApiError
+import com.kirora.androidsdk.model.KiroraError
+import com.kirora.androidsdk.model.KiroraOptions
+import com.kirora.androidsdk.model.KiroraState
+import com.kirora.androidsdk.model.PushPermission
+import com.kirora.androidsdk.model.PushStatus
+import com.kirora.androidsdk.model.UserTokenError
+import com.kirora.androidsdk.net.EventStore
+import com.kirora.androidsdk.net.KiroraApiClient
+import com.kirora.androidsdk.net.KiroraApiService
+import com.kirora.androidsdk.net.KiroraAppOpenReporter
+import com.kirora.androidsdk.net.KiroraBatchManager
+import com.kirora.androidsdk.net.KiroraNetworkMonitor
+import com.kirora.androidsdk.net.PendingPurges
+import com.kirora.androidsdk.net.models.PushConsentRequest
+import com.kirora.androidsdk.push.KiroraPushBridge
+import com.kirora.androidsdk.push.KiroraPushDisplay
+import com.kirora.androidsdk.push.KiroraPushManager
+import com.kirora.androidsdk.push.KiroraPushTracker
+import com.kirora.androidsdk.push.KiroraPushTrampolineActivity
+import com.kirora.androidsdk.push.PushDisplayConfig
+import com.kirora.androidsdk.push.PushListeners
+import com.kirora.androidsdk.session.SessionManager
+import com.kirora.androidsdk.utils.GlobalPreferences
+import com.kirora.androidsdk.utils.JsonSnapshot
+import com.kirora.androidsdk.utils.JwtClaims
+import com.kirora.androidsdk.utils.KiroraContextProvider
+import com.kirora.androidsdk.utils.KiroraLogger
+import com.kirora.androidsdk.utils.KiroraNamespace
+import com.kirora.androidsdk.utils.KiroraPreferences
+import com.kirora.androidsdk.utils.NotJsonError
+import com.kirora.androidsdk.utils.RegistrationDetails
+import com.kirora.androidsdk.utils.SdkInfo
+import com.kirora.androidsdk.utils.toApiError
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicLong
+import kotlin.coroutines.resume
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+
+/**
+ * The Kirora Android SDK: reports what each signed-in user does in the app, so segments, journeys
+ * and messages can act on it; consent comes with it, and push is one channel that uses it.
+ *
+ * ```
+ * val kirora = Kirora(applicationContext, KiroraOptions(clientKey = "kirora_pk_…", fetchUserToken = { myServer.kiroraToken() }))
+ * kirora.identify()              // at every start while signed in, and after sign-in
+ * kirora.track("Order Completed", mapOf("order_id" to "ORD-1042"))
+ * kirora.logout()                // on sign-out
+ * ```
+ *
+ * Create it once, in `Application.onCreate`. A second instance replaces the first: the previous one
+ * is destroyed (its signed-in user carries over). Creating it never blocks on the network and never
+ * asks for notification permission; a failing Kirora never breaks the app.
+ */
+@OptIn(ExperimentalCoroutinesApi::class)
+public class Kirora internal constructor(
+    context: Context,
+    options: KiroraOptions,
+    private val environment: KiroraEnvironment
+) {
+
+    public constructor(context: Context, options: KiroraOptions) : this(context, options, KiroraEnvironment())
+
+    @Volatile
+    public var isInitialized: Boolean = false
+        private set
+
+    /** Why this client is disabled, for [identify] to throw: a setup error, never a runtime one. */
+    @Volatile
+    private var setupError: String? = null
+
+    @Volatile
+    public var options: KiroraOptions = KiroraOptions()
+        private set
+
+    @Volatile
+    private var destroyed = false
+
+    @Volatile
+    private var appContext: Context? = null
+
+    @Volatile
+    private var preferences: KiroraPreferences? = null
+
+    @Volatile
+    private var global: GlobalPreferences? = null
+
+    @Volatile
+    private var contextProvider: KiroraContextProvider? = null
+
+    /** The workspace and API this client stores and sends for. */
+    @Volatile
+    private var namespace: String? = null
+
+    @Volatile
+    private var database: KiroraDatabase? = null
+
+    @Volatile
+    private var store: EventStore? = null
+
+    @Volatile
+    internal var apiService: KiroraApiService? = null
+        private set
+
+    @Volatile
+    internal var batchManager: KiroraBatchManager? = null
+        private set
+
+    @Volatile
+    internal var sessionManager: SessionManager? = null
+        private set
+
+    @Volatile
+    internal var pushManager: KiroraPushManager? = null
+        private set
+
+    @Volatile
+    internal var appOpens: KiroraAppOpenReporter? = null
+        private set
+
+    @Volatile
+    private var networkMonitor: KiroraNetworkMonitor? = null
+
+    @Volatile
+    private var activityCallbacks: Application.ActivityLifecycleCallbacks? = null
+
+    internal val identity = Identity(options.fetchUserToken)
+
+    /** Events a sign-in adopted, given back if Kirora refuses that user's token before accepting it once. */
+    @Volatile
+    private var adoption: Pair<SignedInUser, List<String>>? = null
+
+    // ---- Tracking consent: the answer given to this client, for when storage can't be read ----
+
+    /** The tracking choice in effect: read from storage, or the answer given to this client. */
+    @Volatile
+    private var consent: StoredConsent? = null
+
+    /** When [consent] was last read, so a degraded read is retried now and then, never per event. */
+    @Volatile
+    private var consentReadAt = 0L
+
+
+    // ---- Early token refresh ---------------------------------------------------------------
+
+    @Volatile
+    private var refreshJob: Job? = null
+
+    @Volatile
+    private var foregroundRefresh: Job? = null
+
+    @Volatile
+    private var lastScheduledExpiry = 0L
+
+    private val scope = CoroutineScope(SupervisorJob() + environment.io)
+
+    /** For the callback forms: still runs after [destroy], so every callback is answered. */
+    private val callbackScope = CoroutineScope(SupervisorJob() + environment.io)
+
+    /** Queue writes run one at a time, in call order, so a sign-in adopts exactly what was tracked before it. */
+    private val queueDispatcher = environment.io.limitedParallelism(1)
+
+    private val readiness = CompletableDeferred<Unit>()
+
+    /** True once startup work that does not affect the API (stored look, channel) has finished. */
+    public val isReady: Boolean
+        get() = readiness.isCompleted
+
+    /** Suspends until startup has finished. Nothing requires it: earlier calls are queued behind startup. */
+    public suspend fun awaitReady() {
+        readiness.await()
+    }
+
+    public val isIdentified: Boolean
+        get() = identity.user != null
+
+    public val sessionId: String?
+        get() = sessionManager?.sessionId
+
+    /** The id sent in `context.device.id`, or null when there is none. Reading it never creates one. */
+    public val deviceId: String?
+        get() = preferences?.peekDeviceId()
+
+    /** The FCM token in this device's current registration; null while there is none, even when Firebase holds a token. */
+    public val pushToken: String?
+        get() = pushManager?.registeredToken(identity.user)
+
+    /** Whether behavioural tracking is allowed now. */
+    public val trackingConsent: Boolean
+        get() = trackingAllowed()
+
+    /** The signed-in user's marketing push choice as this device last recorded it with Kirora; false when there is none. */
+    public val pushConsent: Boolean
+        get() = identity.user?.let { preferences?.recordedPushConsent(it.subject) } ?: false
+
+    /**
+     * A snapshot for an app's support and debug screens: read-only, never sent anywhere. Never
+     * prompts, makes no network call and never fails, also before startup ends or after [destroy];
+     * a field it can't read answers its empty value.
+     */
+    public suspend fun getState(): KiroraState = KiroraState(
+        isInitialized = isInitialized && !destroyed,
+        isIdentified = readSafely(false) { !destroyed && isIdentified },
+        deviceId = readSafely(null) { deviceId },
+        sessionId = readSafely(null) { sessionId },
+        pushToken = readSafely(null) { pushToken },
+        trackingConsent = readSafely(false) { trackingConsent },
+        pushConsent = readSafely(false) { pushConsent },
+        queuedEventCount = try {
+            store?.count() ?: 0
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            0
+        },
+    )
+
+    /** [getState] for callers without coroutines; [callback] runs on the main thread, also after [destroy]. */
+    public fun getStateAsync(callback: (KiroraState) -> Unit) {
+        // Not this client's scope: a destroyed client still answers.
+        CoroutineScope(Dispatchers.IO).launch {
+            val state = getState()
+            withContext(Dispatchers.Main) {
+                try {
+                    callback(state)
+                } catch (e: Exception) {
+                    KiroraLogger.e("Error in getState's callback", e)
+                }
+            }
+        }
+    }
+
+    private inline fun <T> readSafely(empty: T, read: () -> T): T = try {
+        read()
+    } catch (e: Exception) {
+        empty
+    }
+
+    private val dropped = AtomicLong()
+
+    /** Events Kirora has given up on since this instance started, whatever the reason. */
+    internal val droppedEventCount: Long
+        get() = dropped.get()
+
+    private fun reportDropped(count: Int, reason: EventDropReason) {
+        if (count <= 0) return
+        dropped.addAndGet(count.toLong())
+        KiroraLogger.w("Dropped $count event(s): $reason")
+    }
+
+    public fun getQueuedEventCountFlow(): Flow<Int>? = store?.countFlow()
+
+    /** Forgets every event waiting on the device. */
+    public fun clearQueue() {
+        val queue = store ?: return
+        scope.launch(queueDispatcher) {
+            try {
+                queue.clearAll()
+            } catch (e: Exception) {
+                KiroraLogger.e("Error clearing event queue", e)
+            }
+        }
+    }
+
+    // Declared after every property above, so it runs with all of them set.
+    init {
+        try {
+            synchronized(Kirora::class.java) { setup(context, options) }
+        } catch (e: Throwable) {
+            // A failing Kirora never breaks the app: it stays disabled.
+            KiroraLogger.e("Kirora failed to start and stays disabled", e)
+            setupError = "Kirora failed to start: ${e.javaClass.simpleName}"
+            isInitialized = false
+        }
+        if (!isInitialized) readiness.complete(Unit)
+    }
+
+    private fun disable(reason: String) {
+        setupError = reason
+        KiroraLogger.e("$reason The SDK stays disabled.")
+    }
+
+    private fun setup(context: Context, options: KiroraOptions) {
+        KiroraLogger.logLevel = options.logLevel
+        val key = options.clientKey.trim()
+        if (key.isEmpty()) return disable("Kirora needs a client key in its options (kirora_pk_…).")
+        if (key.startsWith("kirora_sk_")) {
+            return disable("That is a secret key (kirora_sk_…). Never ship one in an app: use the public client key (kirora_pk_…).")
+        }
+        if (!isApiUrlAllowed(options.apiUrl)) return disable("Kirora's apiUrl must be an https address.")
+
+        val namespace = KiroraNamespace.of(options.apiUrl, key)
+        val previous = active
+        // Only a replacement for the same workspace and API keeps the signed-in user: another one
+        // must never be handed this one's token, nor take its events.
+        val carriedUser = previous?.identity?.user?.takeIf { previous.namespace == namespace }
+        if (previous?.identity?.user != null && carriedUser == null) {
+            KiroraLogger.w("The new Kirora client is for another workspace or API: the signed-in user is not carried over; call identify().")
+        }
+        previous?.destroy()
+        active = this
+
+        val app = context.applicationContext
+        appContext = app
+        this.options = options.withClientKey(key)
+        this.namespace = namespace
+
+        val prefs = KiroraPreferences(app, namespace)
+        preferences = prefs
+        val globalPrefs = GlobalPreferences(app)
+        global = globalPrefs
+        val provider = KiroraContextProvider(app, prefs)
+        contextProvider = provider
+        val db = try {
+            KiroraDatabase.getInstance(app, namespace)
+        } catch (e: Throwable) {
+            KiroraLogger.e("Kirora can't open its event database", e)
+            null
+        }
+        database = db
+        val queue = EventStore(
+            db?.eventDao(),
+            PendingPurges({ prefs.pendingPurges("events") }, { prefs.setPendingPurges("events", it) }, PURGE_RETRY_MS)
+        )
+        store = queue
+
+        val api = KiroraApiClient.create(
+            baseUrl = this.options.apiUrl,
+            clientKeyProvider = { this.options.clientKey },
+            userTokenProvider = { identity.user?.token }
+        )
+        apiService = api
+
+        readConsentAtStart()
+
+        val batchMgr = KiroraBatchManager(
+            store = queue,
+            apiService = api,
+            scope = scope,
+            identity = identity,
+            trackingAllowed = ::trackingAllowed,
+            onTokenRefused = ::onTokenRefused,
+            onDropped = ::reportDropped,
+            clock = environment.clock
+        )
+        batchManager = batchMgr
+
+        val pushMgr = KiroraPushManager(
+            context = app,
+            preferences = prefs,
+            global = globalPrefs,
+            apiService = api,
+            scope = scope,
+            identity = identity,
+            pushOptions = this.options.push,
+            trustedBaseUrl = this.options.apiUrl.toHttpUrlOrNull(),
+            listeners = pushListeners,
+            bridge = if (this.options.push != null) environment.pushBridge ?: loadPushBridge() else null,
+            registrationDetails = { contextProvider?.registrationDetails() ?: RegistrationDetails() },
+            clock = environment.clock
+        )
+        pushManager = pushMgr
+
+        val opens = KiroraAppOpenReporter(
+            dao = db?.appOpenDao(),
+            preferences = prefs,
+            apiService = { apiService },
+            scope = scope,
+            identity = identity,
+            registeredPushAppId = pushMgr::registeredPushAppId,
+            trackingAllowed = ::trackingAllowed,
+            persistSpacing = this.options.trackSessions,
+            purges = PendingPurges({ prefs.pendingPurges("app_opens") }, { prefs.setPendingPurges("app_opens", it) }, PURGE_RETRY_MS),
+            clock = environment.clock
+        )
+        appOpens = opens
+
+        // Already read at startup for the lifecycle events, so the queue reuses it.
+        val appInfo = provider.app
+        sessionManager = SessionManager(
+            preferences = prefs,
+            trackSessions = this.options.trackSessions,
+            trackAppLifecycle = this.options.trackAppLifecycle,
+            appVersion = appInfo.version.ifBlank { "unknown" },
+            appBuild = appInfo.build.ifBlank { "unknown" },
+            trackEvent = { name, properties -> track(name, properties) },
+            owner = { identity.user?.subject },
+            onBackground = { scope.launch { runFlush() } },
+            onForeground = ::checkTokenExpiry,
+            onAppOpen = opens::onAppOpen,
+            isTrackingAllowed = ::trackingAllowed,
+            clock = environment.clock
+        )
+
+        if (this.options.push != null) registerNotificationIntentWatcher(app, pushMgr)
+        val apiUrl = this.options.apiUrl
+        val pushOptions = this.options.push
+        // Disk and system-service work nobody waits on: off the caller's thread.
+        scope.launch(queueDispatcher) {
+            try {
+                if (pushOptions != null) {
+                    // Kept on the device so a push can be drawn, and a tap reported, before the app sets Kirora up.
+                    val display = PushDisplayConfig.of(pushOptions)
+                    globalPrefs.savePushDisplay(display.smallIconResId, display.accentColor, display.channelId, display.channelName)
+                    KiroraPushDisplay.ensureDefaultChannel(app, display)
+                }
+                globalPrefs.saveApiUrl(apiUrl)
+                // What's stored from before the user refused, e.g. before consent was required.
+                if (consentRefused()) forgetTracking()
+            } catch (e: Exception) {
+                KiroraLogger.e("Kirora startup work failed", e)
+            } finally {
+                readiness.complete(Unit)
+            }
+        }
+
+        val netMon = KiroraNetworkMonitor(app) {
+            batchMgr.onNetworkAvailable()
+            opens.onNetworkAvailable()
+        }
+        netMon.start()
+        networkMonitor = netMon
+
+        isInitialized = true
+        // Started last: its first events go through track(), which needs the SDK ready.
+        sessionManager?.start()
+        if (carriedUser != null) {
+            identity.restore(carriedUser)
+            scope.launch {
+                try {
+                    afterSignIn(null, carriedUser)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    KiroraLogger.e("Resuming the signed-in user failed", e)
+                }
+            }
+        }
+        KiroraLogger.d("Kirora SDK initialized.")
+    }
+
+    // ---- Sign-in and sign-out ------------------------------------------------------------
+
+    /**
+     * Signs the user in with [token], or with one from `fetchUserToken` when omitted; registers the
+     * device for push if allowed and sends waiting events. Call it at every start while the user is
+     * signed in. If identify() is called again before a token arrives, the latest call wins.
+     * Throws for the token: [UserTokenError], or [KiroraApiError] with status 401 when Kirora
+     * refuses a fresh one; and [KiroraError] for a setup error (no token and no `fetchUserToken`, a
+     * client key or `apiUrl` this client was disabled for). A push registration that fails otherwise
+     * is logged.
+     */
+    public suspend fun identify(token: String? = null) {
+        setupError?.let { throw KiroraError(it) }
+        if (token == null && options.fetchUserToken == null) {
+            throw KiroraError("identify() needs a user token, or set fetchUserToken in the options")
+        }
+        if (!isInitialized || destroyed) {
+            KiroraLogger.w("Kirora.identify called on a disabled instance.")
+            return
+        }
+        if (token != null && token.isBlank()) throw UserTokenError("identify() takes a user token, or nothing to use fetchUserToken")
+        identity.signIn(token) { previous, user -> afterSignIn(previous, user) }
+    }
+
+    /**
+     * [identify] for callers outside coroutines: returns at once and reports a failure to [onError].
+     * With a [token], the user is signed in by the time this returns.
+     */
+    @JvmOverloads
+    public fun identifyAsync(token: String? = null, onError: ((Throwable) -> Unit)? = null) {
+        scope.launch(start = CoroutineStart.UNDISPATCHED) {
+            try {
+                identify(token)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                KiroraLogger.e("identify failed", e)
+                try {
+                    onError?.invoke(e)
+                } catch (callbackError: Exception) {
+                    KiroraLogger.e("Error in identify's onError", callbackError)
+                }
+            }
+        }
+    }
+
+    /** Once signed in: adopt and send what waits, register the device for push, report a waiting app open. */
+    private suspend fun afterSignIn(previous: SignedInUser?, user: SignedInUser) {
+        if (previous !== user) {
+            // A's unsent events keep A as their owner; only the visit and A's marketing consent end.
+            if (previous != null && previous.subject != user.subject) preferences?.clearUserData()
+            // Also after a restart: a choice recorded for anyone else is theirs, not this user's.
+            preferences?.forgetRecordedPushConsentUnlessOf(user.subject)
+            val sessionOwner = sessionManager?.currentOwner
+            if (sessionOwner != null && sessionOwner != user.subject) sessionManager?.reset()
+        }
+        scheduleTokenRefresh(user)
+        val queue = store
+        if (queue != null) {
+            try {
+                // On the queue's own dispatcher: everything tracked before this sign-in is stored first.
+                withContext(queueDispatcher) {
+                    if (identity.user !== user) return@withContext
+                    val keys = queue.adopt(user.subject)
+                    adoption = if (keys.isNotEmpty() && !user.confirmed) user to keys else null
+                    queue.clearUnnamedExcept(user.subject)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                KiroraLogger.e("Couldn't adopt the events tracked before sign-in", e)
+            }
+        }
+        if (identity.user !== user) return
+        scope.launch { runFlush() }
+        // Only a token problem reaches the caller, after the rest of the sign-in has run.
+        var tokenProblem: Exception? = null
+        try {
+            pushManager?.register(user)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: UserTokenError) {
+            tokenProblem = e
+        } catch (e: KiroraApiError) {
+            if (e.status == 401) tokenProblem = e else KiroraLogger.e("Push registration failed", e)
+        } catch (e: Exception) {
+            KiroraLogger.e("Push registration failed", e)
+        }
+        appOpens?.onSignedIn(user)
+        tokenProblem?.let { throw it }
+        KiroraLogger.d("User identified.")
+    }
+
+    /** A sign-in whose token Kirora never accepted gives back the events it adopted. */
+    private fun onTokenRefused(user: SignedInUser) {
+        val taken = adoption ?: return
+        if (taken.first !== user || user.confirmed) return
+        adoption = null
+        scope.launch(queueDispatcher) {
+            try {
+                store?.release(user.subject, taken.second)
+            } catch (e: Exception) {
+                KiroraLogger.e("Couldn't release adopted events", e)
+            }
+        }
+    }
+
+    /**
+     * Signs the user out at once: whatever is tracked from now on waits for the next sign-in, and
+     * a sign-in still waiting for its token is abandoned. Then attempts to send the outgoing user's
+     * events and detach this device from them, within one 5-second deadline, and drops their unsent
+     * events. Never fails; safe to call twice. A detachment that fails is retried in the background (30 seconds, doubling to 5
+     * minutes, for 24 hours) with the outgoing user's token, held in memory only: if the process
+     * ends first, Kirora is not told until the device registers again.
+     */
+    public suspend fun logout() {
+        if (!isInitialized || destroyed) return
+        val deadline = environment.clock() + LOGOUT_DEADLINE_MS
+        // At once, before anything waits: the outgoing user is captured, a sign-in still waiting
+        // for its token is abandoned (this logout came after it), and whatever is tracked from now
+        // on belongs to no one, waiting for the next sign-in.
+        val user = identity.end() ?: return
+        signOutLocally(user)
+        try {
+            // Independent, both with the outgoing user's token: side by side, so a slow flush
+            // doesn't eat the detachment's share of the deadline.
+            coroutineScope {
+                launch {
+                    val flushed = withTimeoutOrNull((deadline - environment.clock()).coerceAtLeast(1L)) {
+                        batchManager?.flushAs(user)
+                        true
+                    } != null
+                    if (!flushed) KiroraLogger.e("Gave up waiting for Kirora; the user's unsent events are dropped.")
+                }
+                // Bounded by the deadline itself, so a cut-off attempt is still retried in the background.
+                launch { pushManager?.detach(user, deadline) }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            KiroraLogger.e("Logout failed to clean up", e)
+        }
+        dropOwnedBy(user)
+        KiroraLogger.d("User logged out.")
+    }
+
+    /** [logout] for callers outside coroutines: returns at once, then calls [onComplete]. */
+    @JvmOverloads
+    public fun logoutAsync(onComplete: (() -> Unit)? = null) {
+        scope.launch(start = CoroutineStart.UNDISPATCHED) {
+            try {
+                logout()
+            } finally {
+                try {
+                    onComplete?.invoke()
+                } catch (e: Exception) {
+                    KiroraLogger.e("Error in logout's onComplete", e)
+                }
+            }
+        }
+    }
+
+    /** The local part of signing [user] out, done before any network work. */
+    private fun signOutLocally(user: SignedInUser) {
+        if (adoption?.first === user) adoption = null
+        refreshJob?.cancel()
+        refreshJob = null
+        foregroundRefresh?.cancel()
+        foregroundRefresh = null
+        lastScheduledExpiry = 0L
+        sessionManager?.reset()
+        preferences?.clearUserData()
+    }
+
+    /** After the flush: what is left of [user]'s is dropped, so it never goes as the next user. */
+    private fun dropOwnedBy(user: SignedInUser) {
+        // Unless they signed in again meanwhile: then it's theirs to send.
+        if (identity.user?.subject != user.subject) {
+            scope.launch(queueDispatcher) {
+                try {
+                    reportDropped(store?.clearOwnedBy(user.subject) ?: 0, EventDropReason.UNDELIVERABLE)
+                } catch (e: Exception) {
+                    KiroraLogger.e("Couldn't drop the signed-out user's events", e)
+                }
+            }
+            appOpens?.clearOwnedBy(user.subject)
+        }
+        // Kept past a consent withdrawal only so the device could be detached.
+        if (consentRefused()) forgetDeviceIdIfUnused()
+    }
+
+    // ---- Early token refresh ---------------------------------------------------------------
+
+        /** The wait is wall-clock based but `delay` pauses in deep sleep, hence also [checkTokenExpiry] on foreground. */
+    private fun scheduleTokenRefresh(user: SignedInUser) {
+        refreshJob?.cancel()
+        refreshJob = null
+        if (options.fetchUserToken == null) return
+        val token = user.token
+        val expiresAt = JwtClaims.expiresAtMillis(token) ?: return
+        val due = expiresAt - TOKEN_REFRESH_LEAD_MS - environment.clock()
+        // fetchUserToken handed back a token no longer-lived than the last one: refreshing again would loop.
+        if (due <= 0 && expiresAt <= lastScheduledExpiry) return
+        lastScheduledExpiry = expiresAt
+        val wait = due.coerceAtLeast(minRefreshDelayMs)
+        refreshJob = scope.launch {
+            delay(wait)
+            refreshAhead(user, token)
+        }
+    }
+
+    /** Called when the app comes to the foreground: the token may have run out while the process slept. */
+    private fun checkTokenExpiry() {
+        val user = identity.user ?: return
+        if (options.fetchUserToken == null) return
+        val token = user.token
+        val expiresAt = JwtClaims.expiresAtMillis(token) ?: return
+        if (expiresAt - TOKEN_REFRESH_LEAD_MS > environment.clock()) return
+        if (foregroundRefresh?.isActive == true) return
+        foregroundRefresh = scope.launch { refreshAhead(user, token) }
+    }
+
+    private suspend fun refreshAhead(user: SignedInUser, stale: String) {
+        var attempt = 0
+        while (identity.user === user) {
+            val failure: UserTokenError? = try {
+                val fresh = identity.refresh(user, stale)
+                if (fresh != null && fresh != stale) {
+                    scheduleTokenRefresh(user)
+                    return
+                }
+                // Null while still signed in with the same token: the token was for someone else.
+                if (identity.user === user && user.token == stale) UserTokenError("fetchUserToken returned a token for another user") else return
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: UserTokenError) {
+                e
+            }
+            if (++attempt >= MAX_REFRESH_ATTEMPTS) {
+                KiroraLogger.e("Could not refresh the user token before it expired.", failure)
+                return
+            }
+            delay(refreshRetryMs * attempt)
+        }
+    }
+
+    // ---- Tracking --------------------------------------------------------------------------
+
+    /** Queues an event and returns at once. Never throws; [properties] are copied now. */
+    @JvmOverloads
+    public fun track(name: String, properties: Map<String, Any?>? = null) {
+        if (inBeforeSend.get() == true) {
+            KiroraLogger.e("Not tracked: called from beforeSend")
+            return
+        }
+        try {
+            trackInternal(name, properties)
+        } catch (e: Throwable) {
+            KiroraLogger.e("Failed to track an event", e)
+        }
+    }
+
+    private fun trackInternal(name: String, properties: Map<String, Any?>?) {
+        val queue = store
+        val provider = contextProvider
+        if (!isInitialized || destroyed || queue == null || provider == null) {
+            KiroraLogger.w("Kirora.track called on a disabled instance; not tracked.")
+            return
+        }
+        if (!trackingAllowed()) return
+        if (name.isBlank()) {
+            KiroraLogger.e("Not tracked: an event needs a name")
+            reportDropped(1, EventDropReason.INVALID)
+            return
+        }
+        // Copied now, so changing the map after track() doesn't change the event.
+        val snapshot = try {
+            JsonSnapshot.of(properties)
+        } catch (e: NotJsonError) {
+            KiroraLogger.e("$name not tracked: its properties hold ${e.message}")
+            reportDropped(1, EventDropReason.INVALID)
+            return
+        }
+        // Activity first: it may begin a visit with `Session Started`, queued ahead of this event.
+        sessionManager?.onActivity()
+        val occurredAt = environment.clock()
+        val sessionId = sessionManager?.sessionId
+        // Decided now: whoever signs in or out later, this event stays this user's.
+        val owner = identity.user?.subject
+        // Captured with the event, not when the queue gets to it.
+        val capturedContext = provider.getContext(sessionId)
+
+        scope.launch(queueDispatcher) {
+            try {
+                // Consent withdrawn while this was waiting.
+                if (!trackingAllowed()) return@launch
+                var context = capturedContext.toJson(provider.app)
+                var props = snapshot
+                options.beforeSend?.let { hook ->
+                    val redacted = redact(hook, name, props, context) ?: return@launch
+                    props = redacted.first
+                    context = redacted.second
+                }
+                val propertiesJson = props.toString()
+                val contextJson = context.toString()
+                val size = JsonSnapshot.utf8Length(name) + JsonSnapshot.utf8Length(propertiesJson) +
+                    JsonSnapshot.utf8Length(contextJson) + JsonSnapshot.utf8Length(owner ?: "") + EVENT_OVERHEAD_BYTES
+                if (size > EventStore.MAX_BYTES) {
+                    KiroraLogger.e("$name not tracked: larger than the event queue")
+                    reportDropped(1, EventDropReason.INVALID)
+                    return@launch
+                }
+                val entity = EventEntity(
+                    idempotencyKey = UUID.randomUUID().toString(),
+                    name = name,
+                    propertiesJson = propertiesJson,
+                    contextJson = contextJson,
+                    occurredAt = occurredAt,
+                    owner = owner,
+                    sizeBytes = size
+                )
+                reportDropped(queue.add(entity), EventDropReason.QUEUE_FULL)
+                batchManager?.onEventQueued()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                KiroraLogger.e("$name not tracked: it could not be queued", e)
+            }
+        }
+    }
+
+    /**
+     * The event as `beforeSend` leaves it, or null when it drops it. Only the kind of failure is
+     * logged, never the event: it may be what the hook was there to hide.
+     */
+    private fun redact(
+        hook: (BeforeSendEvent) -> BeforeSendEvent?,
+        name: String,
+        properties: JsonObject,
+        context: JsonObject
+    ): Pair<JsonObject, JsonObject>? {
+        val answer = try {
+            inBeforeSend.set(true)
+            hook(BeforeSendEvent(name, JsonSnapshot.toMap(properties), JsonSnapshot.toMap(context)))
+        } catch (e: Throwable) {
+            KiroraLogger.e("$name not tracked: beforeSend threw")
+            return null
+        } finally {
+            inBeforeSend.set(false)
+        }
+        if (answer == null) {
+            KiroraLogger.d("$name dropped by beforeSend")
+            return null
+        }
+        return try {
+            JsonSnapshot.of(answer.properties) to JsonSnapshot.of(answer.context)
+        } catch (e: NotJsonError) {
+            KiroraLogger.e("$name not tracked: beforeSend answered ${e.message}")
+            null
+        }
+    }
+
+    /** Records a `Screen Viewed` event. Screens are named by the app. */
+    public fun trackScreenView(name: String) {
+        track("Screen Viewed", mapOf("name" to name))
+    }
+
+    // ---- Consent ---------------------------------------------------------------------------
+
+    /** What the device has on record: each copy read on its own, null where it can't be read. */
+    private class StoredConsent(val answer: Boolean?, val answerReadable: Boolean, val refusalCopy: Boolean?) {
+        val refused: Boolean get() = answer == false || refusalCopy == true
+        val fullyRead: Boolean get() = answerReadable && refusalCopy != null
+    }
+
+    private fun readStoredConsent(): StoredConsent {
+        val prefs = preferences ?: return StoredConsent(null, false, null)
+        var readable = true
+        val answer = try {
+            prefs.readTrackingConsent()
+        } catch (_: Throwable) {
+            readable = false
+            null
+        }
+        val copy = try {
+            prefs.readRefusalCopy()
+        } catch (_: Throwable) {
+            null
+        }
+        return StoredConsent(answer, readable, copy)
+    }
+
+    /**
+     * The choice in effect, from memory. Storage is read at start; a read that couldn't see both
+     * copies is tried again at most every [CONSENT_REREAD_MS] (before first unlock, say), so
+     * tracking never touches the disk per event.
+     */
+    private fun currentConsent(): StoredConsent {
+        val known = consent
+        val now = environment.clock()
+        if (known != null && (known.fullyRead || now - consentReadAt < CONSENT_REREAD_MS)) return known
+        return readStoredConsent().also {
+            consent = it
+            consentReadAt = now
+        }
+    }
+
+    private fun readConsentAtStart() {
+        // A client replaced a moment ago may still be writing its choice: that choice is the one.
+        unsavedConsent[namespace]?.let { granted ->
+            consent = StoredConsent(answer = granted, answerReadable = true, refusalCopy = !granted)
+            consentReadAt = environment.clock()
+            return
+        }
+        val stored = readStoredConsent()
+        consent = stored
+        consentReadAt = environment.clock()
+        if (stored.refused) {
+            // One copy lost or corrupted: write the refusal back, so losing the other later can't lose it.
+            if (stored.answer != false || stored.refusalCopy != true) {
+                persistConsent(granted = false, restoring = true)
+            }
+            return
+        }
+        if (stored.fullyRead) return
+        val effect = when {
+            !stored.answerReadable && stored.refusalCopy == null ->
+                "neither copy of the tracking choice can be read: nothing is tracked until one can, or setTrackingConsent answers."
+            options.requireTrackingConsent && !stored.answerReadable ->
+                "the saved tracking choice can't be read: nothing is tracked until setTrackingConsent(true); a grant is never assumed."
+            !stored.answerReadable ->
+                "the saved tracking choice can't be read and no refusal is on record: tracking as on a fresh install."
+            else ->
+                "the second copy of a tracking refusal can't be read: following the saved choice."
+        }
+        KiroraLogger.e("Kirora: $effect")
+    }
+
+    /** Saves the choice off the caller's thread, one write after another, surviving [destroy]. */
+    private fun persistConsent(granted: Boolean, restoring: Boolean = false) {
+        val prefs = preferences ?: return
+        val key = namespace ?: return
+        unsavedConsent[key] = granted
+        lastConsentWrite = consentWrites.launch {
+            val saved = try {
+                prefs.writeTrackingConsent(granted)
+            } finally {
+                // Unless a later choice is waiting behind this one.
+                unsavedConsent.remove(key, granted)
+            }
+            when {
+                saved -> KiroraLogger.d("Tracking choice saved: ${if (granted) "granted" else "refused"}.")
+                restoring -> KiroraLogger.e("Kirora: a tracking refusal is on record but couldn't be written back to both copies.")
+                else -> KiroraLogger.e("Can't save the tracking choice on this device: it holds in memory until the app closes, so ask again on the next start.")
+            }
+        }
+    }
+
+    /** A refusal on record in either copy, or given to this client. */
+    private fun consentRefused(): Boolean = currentConsent().refused
+
+    /**
+     * A refusal in either copy always wins; with `requireTrackingConsent`, only a readable grant
+     * allows tracking. Without it, tracking goes on as on a fresh install when the saved choice
+     * can't be read but the refusal copy was read and holds none; with neither copy readable,
+     * nothing is collected.
+     */
+    private fun trackingAllowed(): Boolean {
+        if (destroyed) return false
+        val state = currentConsent()
+        if (state.refused) return false
+        if (options.requireTrackingConsent) return state.answerReadable && state.answer == true
+        return state.answerReadable || state.refusalCopy == false
+    }
+
+    /**
+     * The user's tracking choice, remembered per workspace on the device. `false` stops behavioural
+     * collection even when `requireTrackingConsent` is false, forgets queued events, app opens and
+     * the visit, and cancels sends under way. It does not revoke marketing push consent, turn push
+     * off, or stop operational push reports.
+     */
+    public fun setTrackingConsent(granted: Boolean) {
+        val prefs = preferences
+        if (!isInitialized || destroyed || prefs == null) {
+            KiroraLogger.w("Kirora.setTrackingConsent called on a disabled instance; ignored.")
+            return
+        }
+        val before = trackingAllowed()
+        // Takes effect at once, whether or not it can be saved; saved off this thread.
+        consent = StoredConsent(answer = granted, answerReadable = true, refusalCopy = !granted)
+        consentReadAt = environment.clock()
+        persistConsent(granted)
+        if (!granted) {
+            batchManager?.cancel()
+            forgetTracking()
+        } else if (!before && trackingAllowed()) {
+            // Tracking starts from now; nothing skipped before is made up.
+            sessionManager?.onConsentGranted()
+            scope.launch { batchManager?.flush(waiveBackoff = true) }
+        }
+        KiroraLogger.d("Tracking consent set to: $granted")
+    }
+
+    /** Forgets what behavioural tracking stored, as when the user refuses it. */
+    private fun forgetTracking() {
+        appOpens?.clearAll()
+        sessionManager?.reset()
+        val queue = store
+        if (queue != null) {
+            scope.launch(queueDispatcher) {
+                try {
+                    queue.clearAll()
+                } catch (e: Exception) {
+                    KiroraLogger.e("Couldn't clear events", e)
+                }
+            }
+        }
+        forgetDeviceIdIfUnused()
+    }
+
+    /** The device id is also the installation id, so a push registration or detachment may still need it. */
+    private fun forgetDeviceIdIfUnused() {
+        if (pushManager?.needsDeviceId != true) preferences?.forgetDeviceId()
+    }
+
+    // ---- Push ------------------------------------------------------------------------------
+
+    /**
+     * Records the signed-in user's consent to marketing push with Kirora (`PUT /push-consent`), with
+     * proof. Not behavioural tracking consent, nor the OS permission. Returns once Kirora has
+     * recorded it; throws when it hasn't, so the app learns the choice was not saved:
+     * [KiroraApiError] when Kirora refuses it (a refused token included), [UserTokenError] when a
+     * fresh token can't be had, and [KiroraError] with no one signed in, for a setup error or a
+     * failed network call. Nothing is retried in the background.
+     */
+    public suspend fun setPushConsent(granted: Boolean) {
+        setupError?.let { throw KiroraError(it) }
+        if (destroyed) throw KiroraError("this Kirora client was destroyed: nothing was recorded")
+        identity.settled()
+        consentCalls.withLock { recordPushConsent(granted) }
+    }
+
+    /** One push-consent call at a time, so the saved value is the one Kirora applied last. */
+    private val consentCalls = Mutex()
+
+    private suspend fun recordPushConsent(granted: Boolean) {
+        val user = identity.user ?: throw KiroraError("setPushConsent needs a signed-in user: call identify() first")
+        val api = apiService ?: throw KiroraError("Kirora is not set up")
+        val response = try {
+            val first = api.updatePushConsent(PushConsentRequest(granted), "Bearer ${user.token}")
+            if (first.code() != 401) {
+                first
+            } else {
+                val fresh = identity.refresh(user, user.token)
+                if (fresh == null) first else api.updatePushConsent(PushConsentRequest(granted), "Bearer $fresh")
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: KiroraError) {
+            throw e
+        } catch (e: Exception) {
+            throw KiroraError("push consent was not recorded: network error", e)
+        }
+        if (!response.isSuccessful) throw response.toApiError()
+        // The user's choice, for getState(): kept only while they're the one signed in.
+        if (identity.user?.subject == user.subject) {
+            preferences?.setRecordedPushConsent(user.subject, granted)
+            // Signed out in between: the choice was theirs, so it goes with them.
+            if (identity.user?.subject != user.subject) preferences?.forgetRecordedPushConsentUnlessOf(identity.user?.subject ?: "")
+        }
+        KiroraLogger.d("Push consent recorded: $granted")
+    }
+
+    /** [setPushConsent] for callers outside coroutines; [onResult] gets null once recorded, or the error. */
+    @JvmOverloads
+    public fun setPushConsentAsync(granted: Boolean, onResult: ((KiroraError?) -> Unit)? = null) {
+        callbackScope.launch {
+            val error = try {
+                setPushConsent(granted)
+                null
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: KiroraError) {
+                e
+            } catch (e: Exception) {
+                KiroraError("push consent was not recorded", e)
+            }
+            if (error != null) KiroraLogger.e("setPushConsent failed", error)
+            try {
+                onResult?.invoke(error)
+            } catch (callbackError: Exception) {
+                KiroraLogger.e("Error in setPushConsent's callback", callbackError)
+            }
+        }
+    }
+
+    /**
+     * Shows the system notification prompt when needed, then registers the device if granted, and
+     * answers `granted`, `denied`, `unanswered` or `unsupported`. `granted` also turns the device's
+     * push back on after [setPushEnabled]`(false)`. Does not grant marketing consent.
+     */
+    public suspend fun requestPushPermission(context: Context): PushPermission =
+        suspendCancellableCoroutine { cont ->
+            requestPushPermission(context) { result -> if (cont.isActive) cont.resume(result) }
+        }
+
+    public fun requestPushPermission(context: Context, callback: (PushPermission) -> Unit) {
+        val manager = pushManager
+        if (manager == null || destroyed) callback(PushPermission.UNSUPPORTED) else manager.requestPushPermission(context, callback)
+    }
+
+    /**
+     * This device's push, for an app's "notifications on/off" setting. Never prompts; waits for a
+     * sign-in under way. The platform's permission first (`denied`, `unanswered`, `unsupported`);
+     * with it granted, `enabled` when this device is registered for the signed-in user, `disabled`
+     * otherwise (turned off, signed out, or the registration failed).
+     */
+    public suspend fun getPushStatus(): PushStatus {
+        val manager = pushManager ?: return PushStatus.UNSUPPORTED
+        if (destroyed) return PushStatus.UNSUPPORTED
+        identity.settled()
+        return manager.status(identity.user)
+    }
+
+    /**
+     * The device's own push on/off, kept in its storage, not the user's: it survives sign-out and
+     * applies to whoever signs in next. `false` detaches the device (retried in the background as
+     * logout's detachment is); while it holds, `identify()` does not register. `true` forgets the
+     * choice and registers if permission is already granted, never prompting. Never fails. Not
+     * marketing consent: that is [setPushConsent].
+     */
+    public suspend fun setPushEnabled(enabled: Boolean) {
+        val manager = pushManager ?: return
+        if (destroyed) return
+        identity.settled()
+        try {
+            manager.setEnabled(enabled, identity.user)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            KiroraLogger.e("Couldn't turn push ${if (enabled) "on" else "off"}", e)
+        }
+    }
+
+    /** [getPushStatus] for callers outside coroutines, such as a React Native or Flutter bridge. */
+    public fun getPushStatusAsync(callback: (PushStatus) -> Unit) {
+        callbackScope.launch {
+            val status = try {
+                getPushStatus()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                KiroraLogger.e("Couldn't read the push status", e)
+                PushStatus.UNSUPPORTED
+            }
+            callback(status)
+        }
+    }
+
+    /** [setPushEnabled] for callers outside coroutines. Never fails. */
+    @JvmOverloads
+    public fun setPushEnabledAsync(enabled: Boolean, onComplete: (() -> Unit)? = null) {
+        scope.launch(start = CoroutineStart.UNDISPATCHED) {
+            try {
+                setPushEnabled(enabled)
+            } finally {
+                onComplete?.invoke()
+            }
+        }
+    }
+
+    /** [flush] for callers outside coroutines: [onComplete] runs when this attempt stops. */
+    @JvmOverloads
+    public fun flushAsync(onComplete: (() -> Unit)? = null) {
+        callbackScope.launch {
+            try {
+                flush()
+            } finally {
+                onComplete?.invoke()
+            }
+        }
+    }
+
+    /**
+     * May be called before an instance exists; listeners survive a second instance. Hears taps on
+     * Kirora pushes and their buttons, with the push's data, after the SDK has reported the tap. A
+     * tap that launched the app before anyone listened is held (the latest ten) and delivered when
+     * a listener attaches.
+     */
+    public fun addNotificationClickListener(listener: (Map<String, String>) -> Unit) {
+        pushListeners.click.add(listener)
+        // A tap that launched the app arrives before the app has a chance to listen.
+        val buffered = synchronized(pushListeners.pendingClicks) {
+            pushListeners.pendingClicks.toList().also { pushListeners.pendingClicks.clear() }
+        }
+        buffered.forEach { data ->
+            try {
+                listener(data)
+            } catch (e: Exception) {
+                KiroraLogger.e("Error in notification click listener", e)
+            }
+        }
+    }
+
+    public fun removeNotificationClickListener(listener: (Map<String, String>) -> Unit) {
+        pushListeners.click.remove(listener)
+    }
+
+    public fun addForegroundNotificationListener(listener: (Map<String, String>) -> Unit) {
+        pushListeners.foreground.add(listener)
+    }
+
+    public fun removeForegroundNotificationListener(listener: (Map<String, String>) -> Unit) {
+        pushListeners.foreground.remove(listener)
+    }
+
+    /** For apps with their own `FirebaseMessagingService`: forward `onNewToken` here. */
+    public fun onNewPushToken(token: String) {
+        val manager = pushManager
+        if (manager != null && !destroyed) manager.onNewToken(token) else global?.setPushToken(token)
+    }
+
+    /** True when the push data carries `kirora: "true"`: a Kirora push. Any other push is the app's. */
+    public fun isKiroraPush(data: Map<String, String>): Boolean = Companion.isKiroraPush(data)
+
+    /**
+     * For apps with their own `FirebaseMessagingService`: forward `onMessageReceived` data here.
+     * Returns `true` if it was a Kirora push (now drawn), `false` otherwise.
+     */
+    public fun onPushMessageReceived(data: Map<String, String>): Boolean {
+        val manager = pushManager
+        if (manager != null) return manager.onMessageReceived(data)
+        val context = appContext ?: return Companion.isKiroraPush(data)
+        return handlePushMessage(context, data)
+    }
+
+    /**
+     * Reports a notification tap found in [intent]. Done automatically for every activity when
+     * `push` is on; call it yourself only if you open notifications some other way.
+     */
+    public fun handleNotificationIntent(intent: Intent?): Boolean = pushManager?.handleNotificationIntent(intent) ?: false
+
+    // ---- Delivery and lifecycle -------------------------------------------------------------
+
+    /**
+     * Attempts to send the signed-in user's waiting events now, without bypassing consent or
+     * `Retry-After`. Returns when this attempt stops, including when events remain for a retry; it
+     * is not a receipt that every event was accepted.
+     */
+    public suspend fun flush() {
+        if (!isInitialized || destroyed) return
+        batchManager?.flush(waiveBackoff = true)
+    }
+
+    private suspend fun runFlush() {
+        try {
+            batchManager?.flush()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            KiroraLogger.e("Error flushing events", e)
+        }
+    }
+
+    /**
+     * Stops this client's timers and listeners at once, without sending or deleting anything: for
+     * hot reload, tests and apps that replace their client. A destroyed client tracks and sends
+     * nothing; events still waiting stay on the device for the next client.
+     */
+    public fun destroy() {
+        if (destroyed) return
+        destroyed = true
+        isInitialized = false
+        // Forgetting the user stops work under way for them at its next step.
+        identity.end()
+        batchManager?.destroy()
+        appOpens?.destroy()
+        pushManager?.destroy()
+        refreshJob?.cancel()
+        foregroundRefresh?.cancel()
+        networkMonitor?.stop()
+        networkMonitor = null
+        sessionManager?.stop()
+        activityCallbacks?.let { (appContext as? Application)?.unregisterActivityLifecycleCallbacks(it) }
+        activityCallbacks = null
+        scope.cancel()
+        synchronized(Kirora::class.java) {
+            if (active === this) active = null
+        }
+    }
+
+    private fun registerNotificationIntentWatcher(app: Context, manager: KiroraPushManager) {
+        val application = app as? Application ?: return
+        val callbacks = object : Application.ActivityLifecycleCallbacks {
+            override fun onActivityResumed(activity: Activity) = manager.activityResumed(activity)
+            override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {}
+            override fun onActivityStarted(activity: Activity) {}
+            override fun onActivityPaused(activity: Activity) {}
+            override fun onActivityStopped(activity: Activity) {}
+            override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) {}
+            override fun onActivityDestroyed(activity: Activity) {}
+        }
+        application.registerActivityLifecycleCallbacks(callbacks)
+        activityCallbacks = callbacks
+    }
+
+    private fun loadPushBridge(): KiroraPushBridge? = try {
+        Class.forName(PUSH_BRIDGE_CLASS).getDeclaredConstructor().newInstance() as KiroraPushBridge
+    } catch (_: Throwable) {
+        KiroraLogger.e("push is on, but the android-sdk-push artifact is not on the classpath.")
+        null
+    }
+
+    private fun isApiUrlAllowed(url: String): Boolean {
+        val parsed = url.toHttpUrlOrNull() ?: return false
+        if (parsed.isHttps) return true
+        return parsed.host in setOf("localhost", "127.0.0.1", "10.0.2.2")
+    }
+
+    internal val databaseForTesting: KiroraDatabase?
+        get() = database
+
+    internal fun setApiServiceForTesting(apiService: KiroraApiService) {
+        this.apiService = apiService
+        this.batchManager?.updateApiService(apiService)
+        this.pushManager?.updateApiService(apiService)
+    }
+
+    public companion object {
+        private val pushListeners = PushListeners()
+
+        /** True while `beforeSend` runs on this thread, so tracking from inside it is refused. */
+        private val inBeforeSend = ThreadLocal<Boolean>()
+
+        /**
+         * For the React Native and Flutter wrappers: the `Kirora-SDK` header names the wrapper
+         * (`kirora-react-native`, `kirora-flutter`) and its version. Call before the first
+         * instance. False, changing nothing, for a name or version Kirora would refuse.
+         */
+        @KiroraInternalApi
+        @JvmStatic
+        public fun setWrapperSdk(name: String, version: String): Boolean = SdkInfo.setWrapper(name, version)
+
+        /**
+         * For the React Native and Flutter wrappers: callbacks the app answers across an async bridge.
+         * Each answer is awaited at most 1.5 seconds; without one in time the SDK acts as if there
+         * were no callback (opens the link, shows the push). Used when the matching native option
+         * (`handleDeepLink`, `onForegroundNotification`) is not set.
+         */
+        @KiroraInternalApi
+        @JvmStatic
+        public fun setWrapperCallbacks(
+            handleDeepLink: (suspend (url: String) -> Boolean)?,
+            onForegroundNotification: (suspend (data: Map<String, String>) -> Boolean)?
+        ) {
+            wrapperDeepLinkHandler = handleDeepLink
+            wrapperForegroundHandler = onForegroundNotification
+            wrapperCallbacksSet.complete(Unit)
+        }
+
+        /**
+         * For the React Native and Flutter wrappers ("Push at launch"): call from native code at app
+         * launch, before the client exists. Android's push handling (the FCM service and the tap
+         * activity) is in the manifest, so it already works without a client; this makes the link
+         * of a tap that launched the app wait for the wrapper's first [setWrapperCallbacks], with a
+         * handler or none, for at most 10 seconds, and then opens it as `handleDeepLink` says.
+         *
+         * Call it from a `ContentProvider` or `androidx.startup` initializer in the plugin's manifest,
+         * so it runs before the tap's activity. A later call still covers the next launches of this
+         * install of the app: it is remembered until the app is updated.
+         */
+        @KiroraInternalApi
+        @JvmStatic
+        public fun installPushIntegration(context: Context) {
+            launchIntegration = true
+            appUpdateTime(context.applicationContext)?.let { GlobalPreferences(context.applicationContext).setWrapperPushInstall(it) }
+        }
+
+        /**
+         * For the React Native and Flutter wrappers: the wrapper's engine is gone (Flutter's
+         * `onDetachedFromEngine`, React Native's `invalidate`). Forgets its callbacks, and a later tap's
+         * link waits again (at most 10 seconds) for the next engine's [setWrapperCallbacks] instead of
+         * opening before the app can route it. Use this, not `setWrapperCallbacks(null, null)`, which
+         * means "set up, with no handler".
+         *
+         * The wrapper's tap and foreground listeners are added on its client like any app's
+         * (`addNotificationClickListener`), so the wrapper removes them itself as it detaches; with
+         * no tap listener left, taps are held again (the latest ten) for the next engine's listener.
+         */
+        @KiroraInternalApi
+        @JvmStatic
+        public fun wrapperDetached() {
+            wrapperDeepLinkHandler = null
+            wrapperForegroundHandler = null
+            if (wrapperCallbacksSet.isCompleted) wrapperCallbacksSet = CompletableDeferred()
+        }
+
+        @Volatile
+        private var launchIntegration = false
+
+        @Volatile
+        private var wrapperCallbacksSet = CompletableDeferred<Unit>()
+
+        /** How long a launch tap's link waits for the wrapper's first [setWrapperCallbacks]. */
+        internal const val LAUNCH_LINK_WAIT_MS = 10_000L
+
+        /** The app's process lifecycle: whether any of its screens is showing. Replaced in tests. */
+        @Volatile
+        internal var processLifecycle: () -> Lifecycle = { ProcessLifecycleOwner.get().lifecycle }
+
+        /** How long a launch tap's link, ready while the app is in the background, waits for it to return. */
+        private const val LAUNCH_LINK_HOLD_MS = 5 * 60_000L
+
+        /** True while a wrapper installed push at launch and hasn't set its callbacks yet. */
+        internal fun awaitsWrapperCallbacks(context: Context): Boolean {
+            if (wrapperCallbacksSet.isCompleted) return false
+            if (launchIntegration) return true
+            val installed = try {
+                GlobalPreferences(context).wrapperPushInstall()
+            } catch (_: Exception) {
+                0L
+            }
+            return installed != 0L && installed == appUpdateTime(context)
+        }
+
+        /**
+         * Opens a launch tap's [url] once the wrapper sets its callbacks, or after 10 seconds: its
+         * handler is asked first (at most 1.5 s), then the link goes the usual way.
+         */
+        internal fun openWhenWrapperReady(context: Context, url: String) {
+            val app = context.applicationContext
+            CoroutineScope(SupervisorJob() + Dispatchers.Main).launch {
+                withTimeoutOrNull(LAUNCH_LINK_WAIT_MS) { wrapperCallbacksSet.await() }
+                val handler = wrapperDeepLinkHandler
+                val handled = handler != null && active?.options?.handleDeepLink == null &&
+                    (withTimeoutOrNull(WRAPPER_ANSWER_MS) {
+                        try {
+                            handler(url)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            KiroraLogger.e("Error in the wrapper's deep link handler", e)
+                            false
+                        }
+                    } ?: false)
+                if (!handled) whenInForeground { openLaunchLink(app, url) }
+            }
+        }
+
+        private fun openLaunchLink(app: Context, url: String) {
+            try {
+                KiroraPushTrampolineActivity.openAction(app, url)
+            } catch (e: Exception) {
+                KiroraLogger.w("Could not open the notification's link", e)
+            }
+        }
+
+        /**
+         * Runs [block] now if the app is on screen, else when it next is (within 5 minutes): Android
+         * 10+ blocks starting an activity from the background, and older versions would pull the user
+         * back into the app. Called on the main thread.
+         */
+        private fun whenInForeground(block: () -> Unit) {
+            val lifecycle = try {
+                processLifecycle()
+            } catch (_: Throwable) {
+                return block()
+            }
+            if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return block()
+            val until = SystemClock.elapsedRealtime() + LAUNCH_LINK_HOLD_MS
+            lifecycle.addObserver(object : DefaultLifecycleObserver {
+                override fun onStart(owner: LifecycleOwner) {
+                    lifecycle.removeObserver(this)
+                    if (SystemClock.elapsedRealtime() <= until) block() else KiroraLogger.d("A launch tap's link expired before the app came back.")
+                }
+            })
+        }
+
+        private fun appUpdateTime(context: Context): Long? = try {
+            context.packageManager.getPackageInfo(context.packageName, 0).lastUpdateTime
+        } catch (_: Exception) {
+            null
+        }
+
+        @Volatile
+        internal var wrapperDeepLinkHandler: (suspend (String) -> Boolean)? = null
+
+        @Volatile
+        internal var wrapperForegroundHandler: (suspend (Map<String, String>) -> Boolean)? = null
+
+        /** How long a wrapper's callback is awaited before the SDK acts as if there were none. */
+        internal const val WRAPPER_ANSWER_MS = 1_500L
+
+        /** True when the push data carries `kirora: "true"`: a Kirora push. */
+        public fun isKiroraPush(data: Map<String, String>): Boolean = KiroraPushDisplay.isKiroraPush(data)
+
+        /**
+         * Decides whether a push is drawn while the app is in the foreground. It is, by default;
+         * return `false` to hold one back. Takes precedence over `KiroraPushOptions.onForegroundNotification`
+         * and is kept for the life of the process, so it also works for wrappers that set Kirora up late.
+         */
+        @JvmStatic
+        public fun setForegroundNotificationHandler(handler: ((Map<String, String>) -> Boolean)?) {
+            foregroundHandler = handler
+        }
+
+        @Volatile
+        internal var foregroundHandler: ((Map<String, String>) -> Boolean)? = null
+
+        /**
+         * Draws a Kirora push, with or without an instance, and returns `true`; returns `false` for any
+         * other push, which is then the app's to handle. Used by the FCM service of `android-sdk-push`.
+         */
+        @KiroraInternalApi
+        @JvmStatic
+        public fun handlePushMessage(context: Context, data: Map<String, String>): Boolean {
+            val app = context.applicationContext
+            val current = active
+            val config = current?.options?.push?.let { PushDisplayConfig.of(it) }
+                ?: GlobalPreferences(app).getPushDisplay()
+            return KiroraPushDisplay.handle(
+                app,
+                data,
+                pushListeners,
+                config,
+                foregroundHandler ?: current?.options?.push?.onForegroundNotification
+            )
+        }
+
+        /** A new FCM token, with or without an instance (it is registered once the app signs a user in). */
+        @KiroraInternalApi
+        @JvmStatic
+        public fun handleNewPushToken(context: Context, token: String) {
+            val current = active
+            if (current != null) current.onNewPushToken(token) else GlobalPreferences(context.applicationContext).setPushToken(token)
+        }
+
+        /**
+         * A tap on a Kirora notification or one of its buttons: reports it to the push's
+         * `trackingUrl` (`opened`, or `clicked` for a link or a button), tells the app's click
+         * listeners, and keeps the tap for listeners that attach later. An operational report, sent
+         * whatever the behavioural tracking consent.
+         */
+        @JvmStatic
+        internal fun handleNotificationTap(context: Context, data: Map<String, String>, trackingUrl: String?, clicked: Boolean) {
+            val app = context.applicationContext
+            val current = active
+            KiroraPushTracker.report(
+                app,
+                current?.options?.apiUrl,
+                trackingUrl,
+                if (clicked) KiroraPushTracker.CLICKED else KiroraPushTracker.OPENED,
+                current?.apiService
+            )
+            val clickListeners = pushListeners.click
+            if (clickListeners.isEmpty()) {
+                synchronized(pushListeners.pendingClicks) {
+                    pushListeners.pendingClicks.addLast(data)
+                    while (pushListeners.pendingClicks.size > 10) pushListeners.pendingClicks.removeFirst()
+                }
+            } else {
+                clickListeners.forEach {
+                    try {
+                        it(data)
+                    } catch (e: Exception) {
+                        KiroraLogger.e("Error in notification click listener", e)
+                    }
+                }
+            }
+        }
+
+        /** The most recently created instance, for code that cannot be handed one (e.g. the FCM service). */
+        @Volatile
+        public var active: Kirora? = null
+            private set
+
+        private const val PUSH_BRIDGE_CLASS = "com.kirora.androidsdk.push.fcm.FcmPushBridge"
+        /** `logout()`'s whole deadline, including waiting for a sign-in, the flush and the detachment. */
+        private const val LOGOUT_DEADLINE_MS = 5_000L
+        /** How often a tracking choice that couldn't be fully read is read again. */
+        private const val CONSENT_REREAD_MS = 30_000L
+        /** Tracking-choice writes, in order, for every client in the process; not cancelled by destroy(). */
+        private val consentWrites = CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
+
+        @Volatile
+        private var lastConsentWrite: Job? = null
+
+        /**
+         * Per workspace, the tracking choice still being written. A client created in the meantime
+         * (one replacing another) takes it rather than the storage it hasn't reached yet.
+         */
+        private val unsavedConsent = ConcurrentHashMap<String, Boolean>()
+
+        /** Holds tracking-choice writes until [release] completes, for tests. */
+        internal fun holdConsentWritesForTesting(release: CountDownLatch) {
+            lastConsentWrite = consentWrites.launch { release.await() }
+        }
+
+        /** Waits for tracking-choice writes already started, for tests. */
+        internal suspend fun awaitConsentSavedForTesting() {
+            lastConsentWrite?.join()
+        }
+        /** A token with an `exp` is refreshed this long before it runs out, and on return to the foreground. */
+        private const val TOKEN_REFRESH_LEAD_MS = 60_000L
+
+        /** How long a database that refused an owed deletion is left before it is tried again. */
+        private const val PURGE_RETRY_MS = 30_000L
+        /** The stored event's own fields beyond its name, properties and context: key, time and JSON punctuation. */
+        private const val EVENT_OVERHEAD_BYTES = 160
+
+        /** Keeps a token that expires sooner than its lead from being refreshed in a tight loop. */
+        @Volatile
+        internal var minRefreshDelayMs = 30_000L
+
+        @Volatile
+        internal var refreshRetryMs = 15_000L
+        private const val MAX_REFRESH_ATTEMPTS = 4
+
+        internal fun resetForTesting() {
+            active?.destroy()
+            active = null
+            pushListeners.click.clear()
+            pushListeners.foreground.clear()
+            pushListeners.pendingClicks.clear()
+            foregroundHandler = null
+            wrapperDeepLinkHandler = null
+            wrapperForegroundHandler = null
+            launchIntegration = false
+            wrapperCallbacksSet = CompletableDeferred()
+            processLifecycle = { ProcessLifecycleOwner.get().lifecycle }
+            SdkInfo.resetForTesting()
+            KiroraPushTracker.resetForTesting()
+            minRefreshDelayMs = 30_000L
+            refreshRetryMs = 15_000L
+        }
+    }
+}
