@@ -4,9 +4,8 @@ Connect signed-in users' app activity to Kirora and register their devices for p
 Use the core library for events, screen views and sessions; add the FCM library when
 your app needs push notifications.
 
-**Preview — source version 0.1.0, Android 7.0 / API 24 and later.** The code findings of
-the [review](docs/review.md) are fixed and covered by tests. Still open before release:
-public Maven publication and real-device FCM checks. This guide documents the implemented
+**Preview — source version 0.1.0, Android 7.0 / API 24 and later.** Still open before
+release: public Maven publication and real-device FCM checks. This guide documents the implemented
 API; it does not certify public Maven availability.
 
 ## Choose the library
@@ -418,8 +417,7 @@ Run the unit tests (Robolectric) with:
 ./gradlew :kirora-sdk:testDebugUnitTest
 ```
 
-See the [review](docs/review.md) and the shared
-[SDK contract](../../omnichannel/docs/sdk-interface.md) before release. Physical-device
+Physical-device
 FCM checks (foreground, background, terminated launch, permission changes) are still to do.
 
 ## License

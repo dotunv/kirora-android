@@ -5,7 +5,7 @@ need to do anything to upgrade.
 
 ## Unreleased
 
-### Fixed (from the 17 November review, docs/review.md)
+### Fixed
 - **Event context** matches Kirora's event schema of 17 November: `sessionId`, `locale`, `timezone`,
   `device` (`id`, `manufacturer`, `type: "android"`), `app`, `os`, `screen` and `library`, read when
   the event is tracked. The device model and network details (Wi-Fi, cellular, carrier) are no longer
